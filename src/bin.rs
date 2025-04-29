@@ -23,8 +23,15 @@ use lutgen_palettes::Palette;
 use oklab::{srgb_to_oklab, Oklab};
 use rayon::iter::Either;
 use regex::{Captures, Regex};
+#[cfg(feature = "jxl")]
+use {
+    jpegxl_rs::encode::EncoderResult,
+    jpegxl_rs::image::ToDynamic,
+    jpegxl_rs::{decoder_builder, encoder_builder},
+};
 
-const IMAGE_GLOB: &str = "*.(avif|bmp|dds|exr|ff|gif|hdr|ico|jpg|jpeg|png|pnm|qoi|tga|tiff|webp)";
+const IMAGE_GLOB: &str =
+    "*.(avif|bmp|dds|exr|ff|gif|hdr|ico|jpg|jpeg|jxl|png|pnm|qoi|tga|tiff|webp)";
 
 #[derive(Clone, Debug, Hash)]
 enum DynamicPalette {
@@ -602,16 +609,51 @@ enum Lutgen {
     Palette(#[bpaf(external(palette_args))] PaletteArgs),
 }
 
-fn load_image<P: AsRef<Path>>(path: P) -> Result<DynamicImage, String> {
-    let path = path.as_ref();
-    let time = Instant::now();
-    let lut = image::ImageReader::open(path)
+#[cfg(feature = "jxl")]
+fn decode_jxl(path: &Path) -> Result<DynamicImage, String> {
+    let buf = std::fs::read(path).map_err(|e| format!("failed to read jxl: {e}"))?;
+    let decoder = decoder_builder()
+        .build()
+        .map_err(|e| format!("failed to build JXL decoder: {e}"))?;
+    let img = decoder
+        .decode_to_image(&buf)
+        .map_err(|e| format!("JXL to decode error: {e}"))?
+        .ok_or_else(|| "JXL decode error: no image produced".to_string())?;
+    Ok(img)
+}
+
+#[cfg(not(feature = "jxl"))]
+fn decode_jxl(path: &Path) -> Result<DynamicImage, String> {
+    return Err(
+        "JPEG-XL support was disabled at compile time. Recompile with `--features jxl`.".into(),
+    );
+}
+
+fn decode_generic(path: &Path) -> Result<DynamicImage, String> {
+    let img = image::ImageReader::open(path)
         .map_err(|e| format!("failed to open image: {e}"))?
         .with_guessed_format()
         .map_err(|e| format!("failed to guess image format: {e}"))?
         .decode()
         .map_err(|e| format!("failed to decode image: {e}"))?;
-    println!("✔ Loaded {path:?} in {:.2?}", time.elapsed());
+    Ok(img)
+}
+
+fn load_image<P: AsRef<Path>>(path: P) -> Result<DynamicImage, String> {
+    let path = path.as_ref();
+    let time = Instant::now();
+
+    let lut = match path
+        .extension()
+        .and_then(|s| s.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("jxl") => decode_jxl(path)?,
+        _ => decode_generic(path)?,
+    };
+
+    println!("✔ Loaded {:?} in {:.2?}", path, time.elapsed());
     Ok(lut)
 }
 
@@ -620,6 +662,21 @@ fn load_static_or_animated_image<P: AsRef<Path>>(
 ) -> Result<Either<RgbaImage, Vec<Frame>>, String> {
     let path = path.as_ref();
     let time = Instant::now();
+
+    #[cfg(feature = "jxl")]
+    if path.extension().and_then(|s| s.to_str()) == Some("jxl") {
+        let buf = std::fs::read(path).map_err(|e| format!("failed to read .jxl: {e}"))?;
+        let dec = decoder_builder()
+            .build()
+            .map_err(|e| format!("JXL decoder build error: {e}"))?;
+        let dyn_img = dec
+            .decode_to_image(&buf)
+            .map_err(|e| format!("JXL decode error: {e}"))?
+            .ok_or_else(|| "JXL decode error: no image produced".to_string())?;
+        println!("✔ Loaded {path:?} (JXL) in {:.2?}", time.elapsed());
+        return Ok(Either::Left(dyn_img.into_rgba8()));
+    }
+
     let decoder = image::ImageReader::open(path)
         .map_err(|e| format!("failed to open image: {e}"))?
         .with_guessed_format()
