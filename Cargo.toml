@@ -35,6 +35,10 @@ rayon = "1.10"
 kiddo = "4.2"
 oklab = "1.1"
 arrayref = "0.3"
+jpegxl-rs = { version = "0.11.2", optional = true, features = [
+  "vendored",
+  "image",
+] }
 
 # Bin dependencies
 lutgen-palettes = { version = "0.4", path = "palettes", optional = true }
@@ -51,6 +55,8 @@ optional = true
 [features]
 default = ["bin"]
 bin = ["lutgen-palettes", "bpaf", "strsim", "dirs", "regex", "imara-diff"]
+
+jxl = ["jpegxl-rs"]
 
 [[bin]]
 name = "lutgen"
