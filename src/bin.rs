@@ -25,13 +25,18 @@ use rayon::iter::Either;
 use regex::{Captures, Regex};
 #[cfg(feature = "jxl")]
 use {
-    jpegxl_rs::encode::EncoderResult,
+    jpegxl_rs::decode::PixelFormat,
+    jpegxl_rs::encode::{EncoderFrame, EncoderResult},
     jpegxl_rs::image::ToDynamic,
-    jpegxl_rs::{decoder_builder, encoder_builder},
+    jpegxl_rs::{decoder_builder, encoder_builder, Endianness},
 };
 
+#[cfg(feature = "jxl")]
 const IMAGE_GLOB: &str =
-    "*.(avif|bmp|dds|exr|ff|gif|hdr|ico|jpg|jpeg|jxl|png|pnm|qoi|tga|tiff|webp)";
+    "*.(avif|bmp|dds|exr|ff|gif|hdr|ico|jpg|jpeg|png|pnm|qoi|tga|tiff|webp|jxl)";
+
+#[cfg(not(feature = "jxl"))]
+const IMAGE_GLOB: &str = "*.(avif|bmp|dds|exr|ff|gif|hdr|ico|jpg|jpeg|png|pnm|qoi|tga|tiff|webp)";
 
 #[derive(Clone, Debug, Hash)]
 enum DynamicPalette {
@@ -613,13 +618,19 @@ enum Lutgen {
 fn decode_jxl(path: &Path) -> Result<DynamicImage, String> {
     let buf = std::fs::read(path).map_err(|e| format!("failed to read jxl: {e}"))?;
     let decoder = decoder_builder()
+        .pixel_format(PixelFormat {
+            num_channels: 4,
+            endianness: Endianness::Little,
+            align: 0,
+        })
         .build()
         .map_err(|e| format!("failed to build JXL decoder: {e}"))?;
-    let img = decoder
+
+    let dynimg = decoder
         .decode_to_image(&buf)
         .map_err(|e| format!("JXL to decode error: {e}"))?
-        .ok_or_else(|| "JXL decode error: no image produced".to_string())?;
-    Ok(img)
+        .ok_or_else(|| "no image produced".to_string())?;
+    Ok(DynamicImage::ImageRgba8(dynimg.into_rgba8()))
 }
 
 #[cfg(not(feature = "jxl"))]
@@ -630,13 +641,13 @@ fn decode_jxl(path: &Path) -> Result<DynamicImage, String> {
 }
 
 fn decode_generic(path: &Path) -> Result<DynamicImage, String> {
-    let img = image::ImageReader::open(path)
+    let dynimg = image::ImageReader::open(path)
         .map_err(|e| format!("failed to open image: {e}"))?
         .with_guessed_format()
         .map_err(|e| format!("failed to guess image format: {e}"))?
         .decode()
         .map_err(|e| format!("failed to decode image: {e}"))?;
-    Ok(img)
+    Ok(dynimg)
 }
 
 fn load_image<P: AsRef<Path>>(path: P) -> Result<DynamicImage, String> {
@@ -664,17 +675,20 @@ fn load_static_or_animated_image<P: AsRef<Path>>(
     let time = Instant::now();
 
     #[cfg(feature = "jxl")]
-    if path.extension().and_then(|s| s.to_str()) == Some("jxl") {
-        let buf = std::fs::read(path).map_err(|e| format!("failed to read .jxl: {e}"))?;
-        let dec = decoder_builder()
-            .build()
-            .map_err(|e| format!("JXL decoder build error: {e}"))?;
-        let dyn_img = dec
-            .decode_to_image(&buf)
-            .map_err(|e| format!("JXL decode error: {e}"))?
-            .ok_or_else(|| "JXL decode error: no image produced".to_string())?;
-        println!("✔ Loaded {path:?} (JXL) in {:.2?}", time.elapsed());
-        return Ok(Either::Left(dyn_img.into_rgba8()));
+    if path
+        .extension()
+        .and_then(|s| s.to_str())
+        .map(|s| s.eq_ignore_ascii_case("jxl"))
+        == Some(true)
+    {
+        let dynimg = decode_jxl(path)?;
+        eprintln!("✔ Loaded {:?} (JXL) in {:?}", path, time.elapsed());
+        if let DynamicImage::ImageRgba8(buf) = dynimg {
+            return Ok(Either::Left(buf));
+        } else {
+            // shouldn't happen, but just in case:
+            return Ok(Either::Left(dynimg.to_rgba8()));
+        }
     }
 
     let decoder = image::ImageReader::open(path)
@@ -741,6 +755,85 @@ fn load_static_or_animated_image<P: AsRef<Path>>(
     };
     println!("✔ Loaded {path:?} in {:.2?}", time.elapsed());
     Ok(output)
+}
+
+#[cfg(feature = "jxl")]
+fn save_jxl(img: &RgbaImage, path: &Path) -> Result<(), String> {
+    let (w, h) = (img.width(), img.height());
+    let raw = img.as_raw();
+
+    let mut enc = encoder_builder()
+        .lossless(true)
+        .uses_original_profile(true)
+        .has_alpha(true) // use RGBA instead of RGB
+        .build()
+        .map_err(|e| format!("JXL encoder build failed: {e}"))?;
+
+    let frame = EncoderFrame::new(raw)
+        .num_channels(4)
+        .endianness(Endianness::Little)
+        .align(0);
+
+    let result: EncoderResult<u8> = enc
+        .encode_frame(&frame, w, h)
+        .map_err(|e| format!("JXL encode failed: {e}"))?;
+
+    let data = result.data;
+
+    std::fs::write(path, &data).map_err(|e| e.to_string())
+}
+
+#[cfg(not(feature = "jxl"))]
+fn save_jxl(img: &RgbaImage, path: &Path) -> Result<(), String> {
+    return Err(
+        "JPEG-XL support was disabled at compile time. Recompile with `--features jxl`.".into(),
+    );
+}
+
+fn save_generic(img: &DynamicImage, path: &Path) -> Result<(), String> {
+    match img.save(path) {
+        Ok(()) => Ok(()),
+
+        // fallback to RGB if transparency isn't supported
+        Err(image::ImageError::Unsupported(e)) => {
+            // fallback to saving the image as rgb, without transparency
+            eprintln!(
+                "warning: {} does not support transparency; saving RGB fallback",
+                e.format_hint()
+            );
+            let rgb = img.to_rgb8();
+            rgb.save(path)
+                .map_err(|e| format!("failed to save image: {e}"))
+        },
+
+        Err(e) => Err(format!("failed to write image: {e}")),
+    }
+}
+
+pub fn save_image<I, P>(img: I, path: P) -> Result<(), String>
+where
+    I: Into<DynamicImage>,
+    P: AsRef<Path>,
+{
+    let dyn_img: DynamicImage = img.into();
+    let path = path.as_ref();
+
+    match path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("jxl") => {
+            let buf = dyn_img.to_rgba8();
+            save_jxl(&buf, path)?;
+        },
+        _ => {
+            save_generic(&dyn_img, path)?;
+        },
+    }
+
+    Ok(())
 }
 
 impl Lutgen {
@@ -866,19 +959,10 @@ impl Lutgen {
 
                     let time = Instant::now();
                     let path = Self::find_path(input.len(), dir, &name, file, output.clone());
-                    let res = image.save(&path);
 
-                    match res {
-                        Ok(_) => {},
-                        Err(image::ImageError::Unsupported(e)) => {
-                            // fallback to saving the image as rgb, without transparency
-                            eprintln!("warning: {} does not support transparency", e.format_hint());
-                            image::buffer::ConvertBuffer::<RgbImage>::convert(&image)
-                                .save(&path)
-                                .map_err(|e| format!("failed to save image: {e}"))?;
-                        },
-                        Err(e) => return Err(format!("failed to write image: {e}")),
-                    }
+                    save_image(image, &path).map_err(|e| {
+                        format!("failed to write output `{}`: {}", path.display(), e)
+                    })?;
 
                     println!("✔ Saved output to {path:?} in {:.2?}", time.elapsed());
                 },
